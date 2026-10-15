@@ -1,8 +1,10 @@
 # brenn-forgejo-mcp
 
-A standalone stdio MCP server that exposes five Forgejo pull-request tools:
-`forgejo_open_pr`, `forgejo_get_review_comments`, `forgejo_post_review`,
-`forgejo_add_review_comment`, `forgejo_close_pr`. Built on the `brenn-mcp`
+A standalone stdio MCP server that exposes nine Forgejo pull-request tools:
+`forgejo_open_pr`, `forgejo_list_prs`, `forgejo_get_pr`,
+`forgejo_get_review_comments`, `forgejo_get_pr_comments`,
+`forgejo_post_review`, `forgejo_add_review_comment`, `forgejo_update_pr`,
+`forgejo_close_pr`. Built on the `brenn-mcp`
 crate (its docs cover the `Tool` trait and the stdio JSON-RPC loop). We are
 the MCP subprocess — we do not spawn one.
 
@@ -57,9 +59,9 @@ this, both in code:
 
    The `expose_secret()` call sites are confined to two code regions:
 
-   - **`src/client.rs`** — `ForgejoClient::send` builds the `Authorization`
-     header. This is the *only* production site that materializes the PAT
-     as HTTP-bound bytes.
+   - **`src/client.rs`** — `ForgejoClient::send_with_total` builds the
+     `Authorization` header. This is the *only* production site that
+     materializes the PAT as HTTP-bound bytes.
    - **`src/redact.rs`** — `SecretSet::Builder::push_secret_string` and
      the private `SecretSet::slices` / `SecretSet::max_len` / `SecretSet::new`
      helpers read the bytes for scrubbing and length comparisons. These

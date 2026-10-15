@@ -15,6 +15,14 @@ clients such as Claude Code. Synchronous, no async runtime, built on
   review (Forgejo's REST API has no threaded-reply primitive; the UI groups
   comments on the same file+line, so posting at the same position reads as a
   reply)
+- `forgejo_get_pr_comments` — read a PR's conversation thread (comments typed
+  into the PR's comment box, not review bodies or inline comments)
+- `forgejo_list_prs` — list a repo's PRs by state (`open` / `closed` / `all`),
+  optionally filtered by head branch; each entry is a subset of the PR object
+  including `number`, `head.sha` and `base.ref`
+- `forgejo_get_pr` — fetch one PR's full object
+- `forgejo_update_pr` — edit a PR's title, body or base branch (`base` must be
+  changed in its own call, without `title` or `body`)
 - `forgejo_close_pr` — close a pull request (not merge)
 
 ## Install

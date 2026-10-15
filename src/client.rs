@@ -11,7 +11,7 @@ use reqwest::header::HeaderValue;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 
-use crate::error::classify_response;
+use crate::error::{TRANSIENT_PREFIX, classify_response};
 use crate::redact::SecretSet;
 
 /// Single HTTP client shared across all tools. Cheap to clone
@@ -68,7 +68,9 @@ impl ForgejoClient {
     }
 
     /// GET `/api/v1/repos/{owner}/{repo}/pulls/{index}/reviews?page={page}&limit={limit}`.
-    /// Returns the raw JSON array. Caller handles pagination.
+    /// Returns the raw JSON array and Forgejo's `X-Total-Count` — the number
+    /// of review rows paginated over, including pending reviews the response
+    /// omits. Caller handles pagination.
     pub fn list_reviews(
         &self,
         owner: &str,
@@ -76,7 +78,7 @@ impl ForgejoClient {
         index: u64,
         page: u32,
         limit: u32,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<(Vec<Value>, u64)> {
         let url = format!(
             "{}/api/v1/repos/{owner}/{repo}/pulls/{index}/reviews",
             self.base_url
@@ -85,8 +87,8 @@ impl ForgejoClient {
             .http
             .get(&url)
             .query(&[("page", page.to_string()), ("limit", limit.to_string())]);
-        let v = self.send(req, "GET", &url)?;
-        array_or_panic(v, &url)
+        let (v, total) = self.send_with_total(req, "GET", &url)?;
+        Ok((array_or_panic(v, &url)?, total_count_or_panic(total, &url)))
     }
 
     /// GET `/api/v1/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments`.
@@ -141,6 +143,60 @@ impl ForgejoClient {
         self.send(req, "POST", &url)
     }
 
+    /// GET `/api/v1/repos/{owner}/{repo}/issues/{index}/comments[?since=...]`.
+    /// Not paginated (the endpoint accepts only `since` / `before`); one
+    /// request returns the whole conversation thread.
+    pub fn list_issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        index: u64,
+        since: Option<&str>,
+    ) -> Result<Vec<Value>> {
+        let url = format!(
+            "{}/api/v1/repos/{owner}/{repo}/issues/{index}/comments",
+            self.base_url
+        );
+        let mut req = self.http.get(&url);
+        if let Some(s) = since {
+            req = req.query(&[("since", s)]);
+        }
+        let v = self.send(req, "GET", &url)?;
+        array_or_panic(v, &url)
+    }
+
+    /// GET `/api/v1/repos/{owner}/{repo}/pulls?state={state}&page={page}&limit={limit}`.
+    /// `state` is always sent explicitly. Returns the raw JSON array and
+    /// Forgejo's `X-Total-Count` — the number of PRs matching `state`, i.e.
+    /// the rows paginated over. Caller handles pagination.
+    pub fn list_pulls(
+        &self,
+        owner: &str,
+        repo: &str,
+        state: &str,
+        page: u32,
+        limit: u32,
+    ) -> Result<(Vec<Value>, u64)> {
+        let url = format!("{}/api/v1/repos/{owner}/{repo}/pulls", self.base_url);
+        let req = self.http.get(&url).query(&[
+            ("state", state.to_string()),
+            ("page", page.to_string()),
+            ("limit", limit.to_string()),
+        ]);
+        let (v, total) = self.send_with_total(req, "GET", &url)?;
+        Ok((array_or_panic(v, &url)?, total_count_or_panic(total, &url)))
+    }
+
+    /// GET `/api/v1/repos/{owner}/{repo}/pulls/{index}`.
+    pub fn get_pull(&self, owner: &str, repo: &str, index: u64) -> Result<Value> {
+        let url = format!(
+            "{}/api/v1/repos/{owner}/{repo}/pulls/{index}",
+            self.base_url
+        );
+        let req = self.http.get(&url);
+        self.send(req, "GET", &url)
+    }
+
     /// PATCH `/api/v1/repos/{owner}/{repo}/pulls/{index}`.
     pub fn patch_pull(&self, owner: &str, repo: &str, index: u64, body: &Value) -> Result<Value> {
         let url = format!(
@@ -161,6 +217,20 @@ impl ForgejoClient {
     /// URL-encoding is a no-op in practice; we rely on Forgejo to 404
     /// anything exotic rather than pre-validate.
     fn send(&self, req: RequestBuilder, method: &str, url: &str) -> Result<Value> {
+        self.send_with_total(req, method, url).map(|(v, _)| v)
+    }
+
+    /// Common send path (see `send`). Also returns the response's
+    /// `X-Total-Count` header, raw and unvalidated, when a 2xx carried one.
+    /// Captured before the body is consumed. This function has no opinion
+    /// about the header: callers that read it validate it
+    /// (`total_count_or_panic`); callers that do not never see it.
+    fn send_with_total(
+        &self,
+        req: RequestBuilder,
+        method: &str,
+        url: &str,
+    ) -> Result<(Value, Option<HeaderValue>)> {
         debug!("{method} {url}");
         // Keep this as the only expose_secret() call site. `HeaderValue` is
         // marked sensitive so any `Debug`/`Display` on it prints `Sensitive`
@@ -175,7 +245,9 @@ impl ForgejoClient {
             .map_err(|e| classify_send_error(e, method, url))?;
         let status = resp.status();
         debug!("{method} {url} -> {status}");
-        classify_response(resp, &self.secrets)
+        let total = resp.headers().get("x-total-count").cloned();
+        let v = classify_response(resp, &self.secrets)?;
+        Ok((v, total))
     }
 }
 
@@ -183,7 +255,7 @@ impl ForgejoClient {
 /// read timeout before the response starts) is a transient error — we
 /// haven't seen a status code yet. Surface with the transient prefix.
 fn classify_send_error(e: reqwest::Error, method: &str, url: &str) -> anyhow::Error {
-    anyhow!("Forgejo transient error: {method} {url}: {e}")
+    anyhow!("{TRANSIENT_PREFIX} {method} {url}: {e}")
 }
 
 /// Coerce a `Value` we expected to be a JSON array into `Vec<Value>`.
@@ -196,6 +268,21 @@ fn array_or_panic(v: Value, url: &str) -> Result<Vec<Value>> {
             "protocol break: expected JSON array from {url}, got: {}",
             value_kind_name(&other)
         ),
+    }
+}
+
+/// Interpret a 2xx list response's `X-Total-Count`. Forgejo sets it
+/// unconditionally on paged endpoints; absent, non-ASCII or non-numeric is a
+/// protocol break, the same policy as `array_or_panic`.
+fn total_count_or_panic(raw: Option<HeaderValue>, url: &str) -> u64 {
+    let Some(v) = raw else {
+        panic!("protocol break: {url} answered 2xx without X-Total-Count");
+    };
+    match v.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(n) => n,
+        None => {
+            panic!("protocol break: {url} answered 2xx with a non-numeric X-Total-Count: {v:?}")
+        }
     }
 }
 

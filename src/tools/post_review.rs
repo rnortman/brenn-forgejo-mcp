@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 
 use crate::client::ForgejoClient;
 use crate::tools::{
-    inline_comment_properties, pr_id_properties, required_str, required_u64,
+    inline_comment_properties, optional_str, pr_id_properties, required_str, required_u64,
     validate_inline_comment,
 };
 
@@ -77,7 +77,7 @@ impl Tool for ForgejoPostReviewTool {
 
         let mut body_obj = Map::new();
         body_obj.insert("event".to_string(), json!(event));
-        if let Some(body) = args.get("body").and_then(|v| v.as_str()) {
+        if let Some(body) = optional_str(&args, "body")? {
             body_obj.insert("body".to_string(), json!(body));
         }
 

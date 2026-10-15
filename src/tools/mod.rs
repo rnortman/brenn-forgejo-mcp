@@ -1,19 +1,27 @@
-//! The five Forgejo PR tools, plus shared schema helpers.
+//! The Forgejo PR tools, plus shared schema helpers.
 
 use anyhow::{Result, anyhow};
 use serde_json::{Map, Value, json};
 
 pub mod add_review_comment;
 pub mod close_pr;
+pub mod get_pr;
+pub mod get_pr_comments;
+pub mod list_prs;
 pub mod list_review_comments;
 pub mod open_pr;
 pub mod post_review;
+pub mod update_pr;
 
 pub use add_review_comment::ForgejoAddReviewCommentTool;
 pub use close_pr::ForgejoClosePrTool;
+pub use get_pr::ForgejoGetPrTool;
+pub use get_pr_comments::ForgejoGetPrCommentsTool;
+pub use list_prs::ForgejoListPrsTool;
 pub use list_review_comments::ForgejoGetReviewCommentsTool;
 pub use open_pr::ForgejoOpenPrTool;
 pub use post_review::ForgejoPostReviewTool;
+pub use update_pr::ForgejoUpdatePrTool;
 
 /// `{owner, repo}` property block shared by every PR-touching tool.
 pub fn owner_repo_properties() -> Map<String, Value> {
@@ -29,8 +37,8 @@ pub fn owner_repo_properties() -> Map<String, Value> {
     m
 }
 
-/// `{owner, repo, index}` property block shared by the three tools that
-/// target an existing PR.
+/// `{owner, repo, index}` property block shared by every tool that targets
+/// an existing PR.
 pub fn pr_id_properties() -> Map<String, Value> {
     let mut m = owner_repo_properties();
     m.insert(
@@ -78,6 +86,17 @@ pub fn required_str<'a>(args: &'a Value, name: &str) -> anyhow::Result<&'a str> 
     args.get(name)
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing required field: {name}"))
+}
+
+/// Parse an optional string field from args. Absent or `null` is
+/// `Ok(None)`; a present non-string value is an error rather than being
+/// silently treated as absent.
+pub(crate) fn optional_str<'a>(args: &'a Value, name: &str) -> Result<Option<&'a str>> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(anyhow!("field {name} must be a string")),
+    }
 }
 
 /// Parse a required u64 field from args.
@@ -151,9 +170,178 @@ pub(crate) fn validate_inline_comment(idx: Option<usize>, c: &Value) -> Result<V
     }
 }
 
+/// Fetch pages `1..=max_pages` of a paged Forgejo endpoint. Each `fetch`
+/// returns a page and the endpoint's `X-Total-Count` — the number of rows
+/// the server paginates over. The scan is complete after page `k` when
+/// `k * max(widest, 1) >= total`, where `widest` is the longest page seen:
+/// the server's page size is at least `widest` and at least 1, so every
+/// row fits in the pages fetched. Neither a short page nor an empty page
+/// is evidence of the end: Forgejo clamps `limit` to its `[api]
+/// MAX_RESPONSE_ITEMS`, and `/reviews` hides other users' pending reviews
+/// *after* cutting the page, so a page can be `[]` before the end. (The
+/// floor is what lets a run of empty pages — every row a hidden draft —
+/// satisfy the bound instead of running to the cap.) Returns every item
+/// fetched and whether the cap was reached before completeness was
+/// proven, i.e. more items may exist beyond the cap. Exact when any page
+/// was unfiltered; conservative when every page seen was partially
+/// filtered; never short.
+pub(crate) fn fetch_pages(
+    max_pages: u32,
+    mut fetch: impl FnMut(u32) -> Result<(Vec<Value>, u64)>,
+) -> Result<(Vec<Value>, bool)> {
+    let mut items = Vec::new();
+    let mut widest = 0usize;
+    for page in 1..=max_pages {
+        // `total` is re-read on every page; the latest value is compared.
+        let (batch, total) = fetch(page)?;
+        widest = widest.max(batch.len());
+        items.extend(batch);
+        if u64::from(page) * (widest.max(1) as u64) >= total {
+            return Ok((items, false));
+        }
+    }
+    Ok((items, true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pages_of(
+        sizes: &'static [usize],
+        total: u64,
+    ) -> impl FnMut(u32) -> Result<(Vec<Value>, u64)> {
+        move |page| Ok((vec![json!(page); sizes[page as usize - 1]], total))
+    }
+
+    /// Run `fetch_pages` over `pages_of(sizes, total)`, recording the pages
+    /// requested.
+    fn scan(max_pages: u32, sizes: &'static [usize], total: u64) -> (Vec<Value>, bool, Vec<u32>) {
+        let mut requested = Vec::new();
+        let mut fetch = pages_of(sizes, total);
+        let (items, cap) = fetch_pages(max_pages, |page| {
+            requested.push(page);
+            fetch(page)
+        })
+        .unwrap();
+        (items, cap, requested)
+    }
+
+    #[test]
+    fn fetch_pages_stops_when_widest_covers_total() {
+        let (items, cap, requested) = scan(10, &[3], 3);
+        assert_eq!(items, vec![json!(1); 3]);
+        assert!(!cap);
+        assert_eq!(requested, vec![1]);
+    }
+
+    #[test]
+    fn fetch_pages_zero_total_is_one_fetch() {
+        let (items, cap, requested) = scan(10, &[0], 0);
+        assert!(items.is_empty());
+        assert!(!cap);
+        assert_eq!(requested, vec![1]);
+    }
+
+    #[test]
+    fn fetch_pages_single_hidden_row_is_one_fetch() {
+        let (items, cap, requested) = scan(10, &[0], 1);
+        assert!(items.is_empty());
+        assert!(!cap);
+        assert_eq!(requested, vec![1]);
+    }
+
+    #[test]
+    fn fetch_pages_all_hidden_stops_after_total_pages() {
+        let (items, cap, requested) = scan(10, &[0, 0, 0], 3);
+        assert!(items.is_empty());
+        assert!(!cap);
+        assert_eq!(requested, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn fetch_pages_all_hidden_past_cap_reports_cap() {
+        let (items, cap, requested) = scan(2, &[0, 0], 3);
+        assert!(items.is_empty());
+        assert!(cap);
+        assert_eq!(requested, vec![1, 2]);
+    }
+
+    #[test]
+    fn fetch_pages_exact_multiple_needs_no_extra_request() {
+        let (items, cap, requested) = scan(10, &[2, 2], 4);
+        assert_eq!(items, vec![json!(1), json!(1), json!(2), json!(2)]);
+        assert!(!cap);
+        assert_eq!(requested, vec![1, 2]);
+    }
+
+    #[test]
+    fn fetch_pages_exact_multiple_at_cap_is_not_flagged() {
+        let (items, cap, requested) = scan(2, &[2, 2], 4);
+        assert_eq!(items.len(), 4);
+        assert!(!cap);
+        assert_eq!(requested, vec![1, 2]);
+    }
+
+    #[test]
+    fn fetch_pages_continues_past_empty_page() {
+        let (items, cap, requested) = scan(10, &[0, 2], 4);
+        assert_eq!(items, vec![json!(2), json!(2)]);
+        assert!(!cap);
+        assert_eq!(requested, vec![1, 2]);
+    }
+
+    #[test]
+    fn fetch_pages_short_pages_under_clamp() {
+        let (items, cap, requested) = scan(10, &[20, 20, 5], 45);
+        assert_eq!(items.len(), 45);
+        assert!(!cap);
+        assert_eq!(requested, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn fetch_pages_filtered_page_keeps_widest_bound() {
+        let (items, cap, requested) = scan(10, &[5, 2], 10);
+        assert_eq!(items.len(), 7);
+        assert!(!cap);
+        assert_eq!(requested, vec![1, 2]);
+    }
+
+    #[test]
+    fn fetch_pages_reports_cap_when_total_not_covered() {
+        let (items, cap, requested) = scan(2, &[1, 1], 5);
+        assert_eq!(items.len(), 2);
+        assert!(cap);
+        assert_eq!(requested, vec![1, 2]);
+    }
+
+    #[test]
+    fn fetch_pages_propagates_error() {
+        let err = fetch_pages(3, |_| Err(anyhow!("boom"))).unwrap_err();
+        assert_eq!(format!("{err:#}"), "boom");
+    }
+
+    #[test]
+    fn optional_str_absent_is_none() {
+        assert_eq!(optional_str(&json!({}), "x").unwrap(), None);
+    }
+
+    #[test]
+    fn optional_str_null_is_none() {
+        assert_eq!(optional_str(&json!({ "x": null }), "x").unwrap(), None);
+    }
+
+    #[test]
+    fn optional_str_string_is_some() {
+        assert_eq!(optional_str(&json!({ "x": "v" }), "x").unwrap(), Some("v"));
+        assert_eq!(optional_str(&json!({ "x": "" }), "x").unwrap(), Some(""));
+    }
+
+    #[test]
+    fn optional_str_non_string_errors() {
+        let err = optional_str(&json!({ "x": 42 }), "x").unwrap_err();
+        assert_eq!(format!("{err:#}"), "field x must be a string");
+    }
 
     #[test]
     fn rejects_both_positions_set() {

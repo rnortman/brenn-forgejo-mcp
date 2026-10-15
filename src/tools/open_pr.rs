@@ -5,7 +5,7 @@ use brenn_mcp::Tool;
 use serde_json::{Map, Value, json};
 
 use crate::client::ForgejoClient;
-use crate::tools::{owner_repo_properties, required_str};
+use crate::tools::{optional_str, owner_repo_properties, required_str};
 
 pub struct ForgejoOpenPrTool {
     pub client: ForgejoClient,
@@ -61,7 +61,7 @@ impl Tool for ForgejoOpenPrTool {
         body_obj.insert("title".to_string(), json!(title));
         body_obj.insert("head".to_string(), json!(head));
         body_obj.insert("base".to_string(), json!(base));
-        if let Some(body) = args.get("body").and_then(|v| v.as_str()) {
+        if let Some(body) = optional_str(&args, "body")? {
             body_obj.insert("body".to_string(), json!(body));
         }
 

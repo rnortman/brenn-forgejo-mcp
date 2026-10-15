@@ -2,7 +2,9 @@
 //! their inline comments.
 //!
 //! Two endpoints:
-//! - GET `/pulls/{index}/reviews` (paginated)
+//! - GET `/pulls/{index}/reviews` (paginated; Forgejo hides other users'
+//!   pending reviews *after* cutting the page, so an empty page is not the
+//!   end — the scan stops by `X-Total-Count`, see `fetch_pages`)
 //! - GET `/pulls/{index}/reviews/{id}/comments` (NOT paginated per swagger;
 //!   we detect `len == MAX_RESPONSE_ITEMS` as a conservative truncation
 //!   signal)
@@ -13,7 +15,7 @@ use log::warn;
 use serde_json::{Value, json};
 
 use crate::client::ForgejoClient;
-use crate::tools::{pr_id_properties, required_str, required_u64};
+use crate::tools::{fetch_pages, optional_str, pr_id_properties, required_str, required_u64};
 
 /// Forgejo/Gitea `MAX_RESPONSE_ITEMS` default. The
 /// `/reviews/{id}/comments` endpoint is not paginated, so we treat
@@ -24,7 +26,7 @@ const FORGEJO_MAX_RESPONSE_ITEMS: usize = 50;
 /// Per-page `limit` for the paginated `/reviews` endpoint.
 const REVIEWS_PAGE_LIMIT: u32 = 50;
 
-/// Cap on `/reviews` pagination. Worst case: 10 × 50 = 500 reviews.
+/// Cap on `/reviews` pagination: 10 pages; 500 reviews at Forgejo's default page size.
 const REVIEWS_MAX_PAGES: u32 = 10;
 
 pub struct ForgejoGetReviewCommentsTool {
@@ -68,28 +70,18 @@ impl Tool for ForgejoGetReviewCommentsTool {
         let owner = required_str(&args, "owner")?;
         let repo = required_str(&args, "repo")?;
         let index = required_u64(&args, "index")?;
-        let state_filter = args.get("state").and_then(|v| v.as_str());
+        let state_filter = optional_str(&args, "state")?;
 
-        let mut reviews: Vec<Value> = Vec::new();
-        let mut reviews_page_cap_hit = false;
-        let mut capped_review_ids: Vec<u64> = Vec::new();
-
-        for page in 1..=REVIEWS_MAX_PAGES {
-            let batch = self
-                .client
-                .list_reviews(owner, repo, index, page, REVIEWS_PAGE_LIMIT)?;
-            let got = batch.len();
-            reviews.extend(batch);
-            if got < REVIEWS_PAGE_LIMIT as usize {
-                break;
-            }
-            if page == REVIEWS_MAX_PAGES && got == REVIEWS_PAGE_LIMIT as usize {
-                reviews_page_cap_hit = true;
-                warn!(
-                    "get_review_comments: hit {REVIEWS_MAX_PAGES}-page cap on reviews for {owner}/{repo}#{index}"
-                );
-            }
+        let (reviews, reviews_page_cap_hit) = fetch_pages(REVIEWS_MAX_PAGES, |page| {
+            self.client
+                .list_reviews(owner, repo, index, page, REVIEWS_PAGE_LIMIT)
+        })?;
+        if reviews_page_cap_hit {
+            warn!(
+                "get_review_comments: hit {REVIEWS_MAX_PAGES}-page cap on reviews for {owner}/{repo}#{index}"
+            );
         }
+        let mut capped_review_ids: Vec<u64> = Vec::new();
 
         let mut enriched: Vec<Value> = Vec::with_capacity(reviews.len());
         for review in reviews {

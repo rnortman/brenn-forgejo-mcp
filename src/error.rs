@@ -7,6 +7,10 @@ use serde_json::Value;
 
 use crate::redact::{SecretSet, scrub_str};
 
+/// Leading text of every transient-error message. Callers that classify
+/// errors by kind match on this prefix.
+pub(crate) const TRANSIENT_PREFIX: &str = "Forgejo transient error:";
+
 /// Peel a `reqwest::blocking::Response` into one of three outcomes:
 ///
 /// - 2xx with valid JSON → `Ok(Value)`.
@@ -25,7 +29,7 @@ pub fn classify_response(resp: Response, secrets: &SecretSet) -> Result<Value> {
     let status = resp.status();
     let body_bytes = resp
         .bytes()
-        .map_err(|e| anyhow!("Forgejo transient error: reading response body: {e}"))?;
+        .map_err(|e| anyhow!("{TRANSIENT_PREFIX} reading response body: {e}"))?;
 
     if status.is_success() {
         // 2xx: body must be valid JSON; anything else means the API shape
@@ -43,7 +47,7 @@ pub fn classify_response(resp: Response, secrets: &SecretSet) -> Result<Value> {
     } else {
         // 5xx and anything else non-success: transient. Status only, no
         // body preview (see doc comment).
-        Err(anyhow!("Forgejo transient error: HTTP {status}"))
+        Err(anyhow!("{TRANSIENT_PREFIX} HTTP {status}"))
     }
 }
 

@@ -5,29 +5,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use brenn_mcp::Server;
 use clap::Parser;
 use log::{LevelFilter, info};
 
 use brenn_forgejo_mcp::client::ForgejoClient;
 use brenn_forgejo_mcp::config::{ResolvedConfig, peek_toml_token, promote_log_level, resolve};
 use brenn_forgejo_mcp::redact::{RedactingWriter, SecretSet};
-use brenn_forgejo_mcp::tools::{
-    ForgejoAddReviewCommentTool, ForgejoClosePrTool, ForgejoGetReviewCommentsTool,
-    ForgejoOpenPrTool, ForgejoPostReviewTool,
-};
-
-const INSTRUCTIONS: &str = "\
-This server exposes Forgejo pull-request operations: open a PR, read existing reviews and inline comments, post a review (approve / request changes / comment, optionally with inline comments), and close a PR. PR numbers are per-repo (\"index\" arg).
-
-Inline-comment field naming is NOT symmetric between read and write (this reflects Forgejo's own API, we don't translate):
-- When you READ comments via `forgejo_get_review_comments`, each comment has `position` (line on the post-change side) and `original_position` (line on the pre-change side).
-- When you WRITE comments via `forgejo_post_review`, use `new_position` (post-change) and `old_position` (pre-change), and provide exactly one of the two per comment.
-
-Errors returned as `isError: true` are safe to show the user. Transient errors (prefix \"Forgejo transient error:\") may be retried; API errors (prefix \"Forgejo API error (XXX):\") indicate an input or auth problem and should not be retried without changing something.
-
-`forgejo_add_review_comment` appends an inline comment to an existing review (identified by `review_id`). Forgejo's REST API does not thread replies under a specific parent comment, but the UI groups comments on the same file+line into one conversation, so posting at the same position as a reviewer's comment reads as a reply.\
-";
+use brenn_forgejo_mcp::server::build_server;
 
 #[derive(Parser)]
 #[command(version, about = "Forgejo pull-request tools as an MCP server (stdio)")]
@@ -136,21 +120,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let server = Server::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
-        .with_instructions(INSTRUCTIONS)
-        .with_tool(ForgejoOpenPrTool {
-            client: client.clone(),
-        })
-        .with_tool(ForgejoGetReviewCommentsTool {
-            client: client.clone(),
-        })
-        .with_tool(ForgejoPostReviewTool {
-            client: client.clone(),
-        })
-        .with_tool(ForgejoAddReviewCommentTool {
-            client: client.clone(),
-        })
-        .with_tool(ForgejoClosePrTool { client });
+    let server = build_server(client);
 
     match server.run() {
         Ok(()) => ExitCode::SUCCESS,
