@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-15
+
 ### Added
 
 - `forgejo_get_pr_comments`: read a PR's conversation thread — the
@@ -56,4 +58,5 @@ First public release, under the Apache-2.0 license. Development through
 - Secret-scanning (`brenn-scrub`, `gitleaks`) git hooks, installed with
   `make setup-hooks`, and a GitHub Actions CI workflow.
 
+[0.3.0]: https://github.com/rnortman/brenn-forgejo-mcp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/rnortman/brenn-forgejo-mcp/releases/tag/v0.2.0
