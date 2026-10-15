@@ -1,0 +1,84 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy target'
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - prod
+
+# Required Forgejo repo variables (Settings -> Actions -> Variables):
+#   DEPLOY_HOST  — SSH deploy target (e.g. myuser@myserver)
+
+jobs:
+  build-deploy:
+    runs-on: shell
+    env:
+      MUSL_TARGET: x86_64-unknown-linux-musl
+    steps:
+      - name: Clean workspace
+        run: rm -rf src brenn-forgejo-mcp-*-linux-x86_64 *.tar.gz VERSION
+
+      - name: Checkout brenn-forgejo-mcp
+        run: |
+          CLONE_URL=$(echo "$GITHUB_SERVER_URL" | sed "s|://|://token:${TOKEN}@|")
+          git clone "${CLONE_URL}/${GITHUB_REPOSITORY}.git" src
+          cd src && git checkout "$GITHUB_SHA"
+        env:
+          TOKEN: ${{ github.token }}
+
+      - name: Run checks
+        run: cd src && make rust-check
+
+      - name: Determine version
+        run: |
+          cd src
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "${GITHUB_REF#refs/tags/v}" > ../VERSION
+          else
+            git rev-parse --short HEAD > ../VERSION
+          fi
+          echo "Version: $(cat ../VERSION)"
+
+      - name: Build release
+        run: |
+          export CARGO_TARGET_DIR="$HOME/.build-cache/brenn-forgejo-mcp"
+          cd src && make release-musl
+
+      - name: Package tarball
+        run: |
+          VERSION=$(cat VERSION)
+          DIST="brenn-forgejo-mcp-${VERSION}-linux-x86_64"
+          BUILD_CACHE="$HOME/.build-cache/brenn-forgejo-mcp"
+          mkdir -p "${DIST}/bin"
+
+          cp "${BUILD_CACHE}/${MUSL_TARGET}/release/brenn-forgejo-mcp" "${DIST}/bin/"
+
+          cp src/deploy/deploy.sh "${DIST}/"
+          chmod +x "${DIST}/deploy.sh"
+          echo "$VERSION" > "${DIST}/VERSION"
+
+          tar czf "${DIST}.tar.gz" "$DIST"
+          ls -lh "${DIST}.tar.gz"
+
+      - name: Deploy
+        run: |
+          VERSION=$(cat VERSION)
+          DIST="brenn-forgejo-mcp-${VERSION}-linux-x86_64"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TARGET=prod
+          else
+            TARGET="${{ inputs.environment }}"
+          fi
+          TARGET="${TARGET:-staging}"
+
+          scp "${DIST}.tar.gz" "${{ vars.DEPLOY_HOST }}:/tmp/"
+          ssh "${{ vars.DEPLOY_HOST }}" "cd /tmp && tar xzf ${DIST}.tar.gz && ${DIST}/deploy.sh ${TARGET} && rm -rf /tmp/${DIST} /tmp/${DIST}.tar.gz"

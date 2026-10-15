@@ -1,0 +1,5 @@
+/target
+.gitleaks.local.toml
+CLAUDE.local.md
+.claude/settings.local.json
+/docs/
